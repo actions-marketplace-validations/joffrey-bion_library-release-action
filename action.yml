@@ -1,4 +1,4 @@
-name: 'Release to Maven Central'
+name: 'Gradle library release'
 description: 'Builds, publishes, generates the change log, and creates a GitHub release'
 branding:
   icon: 'arrow-up-circle'
@@ -9,6 +9,7 @@ inputs:
     required: true
   github-token:
     description: 'The GitHub token to access issues for the change log generation'
+    default: ${{ github.token }}
     required: true
   gpg-signing-key:
     description: 'The ASCII-armored private GPG key to sign artifacts'
@@ -22,33 +23,77 @@ inputs:
   sonatype-password:
     description: 'The password to connect to the Sonatype Nexus (e.g. OSSRH for Maven Central)'
     required: true
+  changelog-commit-username:
+    description: 'The git user.name for the change log commit author'
+    default: 'github-actions[bot]'
+    required: true
+  changelog-commit-email:
+    description: 'The git user.email for the change log commit author'
+    default: '41898282+github-actions[bot]@users.noreply.github.com'
+    required: true
+  gradle-publish-tasks:
+    description: 'The tasks to call to publish artifacts to maven'
+    default: publishToSonatype closeAndReleaseSonatypeStagingRepository
+    required: true
+  extra-gradle-args:
+    description: 'Extra arguments to pass to the Gradle command line'
+    required: false
+outputs:
+  changelog-path:
+    description: "The path to the generated changelog file"
+    value: CHANGELOG.md
+  release-notes-path:
+    description: "The path to the generated release notes"
+    value: build/reports/changelog/latest-release-body.md
 runs:
   using: "composite"
   steps:
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
       - name: Build and publish to OSS Sonatype and then Maven Central
-        uses: gradle/gradle-build-action@v2
         env:
-          # For changelog generation
+          # To avoid API limits during GitHub changelog generation
           GITHUB_TOKEN: ${{ inputs.github-token }}
+
           # GPG keys for signing plugin (sign maven artifacts)
-          # see https://docs.gradle.org/current/userguide/signing_plugin.html#sec:in-memory-keys
+          # 1. Properties as named in the sample snippets in the Gradle documentation
+          # https://docs.gradle.org/current/userguide/signing_plugin.html#sec:in-memory-keys
           ORG_GRADLE_PROJECT_signingKey: ${{ inputs.gpg-signing-key }}
           ORG_GRADLE_PROJECT_signingPassword: ${{ inputs.gpg-signing-password }}
-          # Credentials implicitly read by the gradle-nexus-publish-plugin
+          # 2. Properties expected by the gradle-maven-publish-plugin
+          # https://vanniktech.github.io/gradle-maven-publish-plugin/central/#__tabbed_5_2
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ inputs.gpg-signing-key }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ inputs.gpg-signing-password }}
+
+          # Sonatype credentials
+          # 1. Properties expected by the gradle-nexus-publish-plugin
           # https://github.com/gradle-nexus/publish-plugin#publishing-to-maven-central-via-sonatype-ossrh
           ORG_GRADLE_PROJECT_sonatypeUsername: ${{ inputs.sonatype-username }}
           ORG_GRADLE_PROJECT_sonatypePassword: ${{ inputs.sonatype-password }}
-        with:
-          arguments: |
-            check
-            generateChangelog
-            publishToSonatype
-            closeAndReleaseSonatypeStagingRepository
-            -Pversion=${{ inputs.version }}
+          # 2. Properties expected by the gradle-maven-publish-plugin
+          # https://vanniktech.github.io/gradle-maven-publish-plugin/central/#__tabbed_5_2
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ inputs.sonatype-username }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ inputs.sonatype-password }}
+        shell: bash
+        # There are issues with the configuration cache when publishing, hence the --no-configuration-cache argument.
+        # See https://scans.gradle.com/s/ur3xe6d353a2e for an example release build failure due to this.
+        # 1) Dokka doesn't support it (https://github.com/Kotlin/dokka/issues/1217) but they marked their tasks incompatible.
+        # 2) GitHub Changelog Generator doesn't support it (https://github.com/joffrey-bion/gradle-github-changelog/issues/92),
+        #    I marked the task as not supporting it, but it seems the extension might also cause problems.
+        # 3) The Gradle Nexus Publish Plugin doesn't support it (https://github.com/gradle-nexus/publish-plugin/issues/221)
+        #    and this may cause failures like "No staging repository with name sonatype created" during the build.
+        # 4) The Gradle Maven Publish Plugin by Vanniktech doesn't support it because of
+        #    https://github.com/gradle/gradle/issues/22779
+        run: ./gradlew check generateChangelog ${{ inputs.gradle-publish-tasks }} -Pversion=${{ inputs.version }} --no-configuration-cache ${{ inputs.extra-gradle-args }}
 
       - name: Commit and push change log
         id: changelog-commit
+        shell: bash
         run: |
+          git config --global user.name "${{ inputs.changelog-commit-username }}"
+          git config --global user.email "${{ inputs.changelog-commit-email }}"
+
           git add CHANGELOG.md
           git commit -m "Version ${{ inputs.version }}"
           git push
